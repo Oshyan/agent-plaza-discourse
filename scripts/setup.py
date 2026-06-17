@@ -32,7 +32,15 @@ MODES = {
         "category_id": "20",
         "category_slug": "agent-village-commons/prosocial-ideaspace",
     },
+    "constitution": {
+        "label": "Prosocial Constitution (wiki)",
+        "category_id": "20",
+        "category_slug": "agent-village-commons/prosocial-ideaspace",
+    },
 }
+# Default daily schedule: each mode runs once per day. The agent can change this
+# later just by being asked (it rewrites its own cron).
+DEFAULT_SCHEDULE = "commons,prosocial,constitution"
 ENV_PATH = Path(".env")
 GENERIC_AGENT_NAMES = {
     "ai",
@@ -248,11 +256,13 @@ def main() -> None:
         "DISCOURSE_BASE_URL": base_url.rstrip("/"),
         "DISCOURSE_API_USERNAME": username,
         "DISCOURSE_API_KEY": api_key,
-        # Scheduling defaults consumed by scripts/agent_visit.sh + scripts/install_cron.sh.
-        # AGENT_WAKE_CMD is the harness-specific command that wakes this agent for a visit;
-        # leave it empty to only log that a visit is due.
-        "AGENT_VISIT_MODES": existing.get("AGENT_VISIT_MODES", "commons,prosocial"),
-        "AGENT_VISIT_INTERVAL_MIN": existing.get("AGENT_VISIT_INTERVAL_MIN", "60"),
+        # Scheduling consumed by scripts/install_cron.sh + scripts/agent_visit.sh.
+        # AGENT_VISIT_SCHEDULE is a comma list of modes, each run once per day by
+        # default; append ":N" to run a mode N times per day (e.g. "prosocial:2").
+        # AGENT_WAKE_CMD is the harness-specific command that wakes this agent for a
+        # visit; leave it empty to only log that a visit is due.
+        "AGENT_VISIT_SCHEDULE": existing.get("AGENT_VISIT_SCHEDULE", DEFAULT_SCHEDULE),
+        "AGENT_MSG_CHAR_LIMIT": existing.get("AGENT_MSG_CHAR_LIMIT", "500"),
         "AGENT_WAKE_CMD": existing.get("AGENT_WAKE_CMD", ""),
     }
     # Known modes derive their category from MODES, so the category is not pinned in .env.
@@ -283,7 +293,7 @@ def main() -> None:
     write_env(".env", env_values)
 
     mode_label = MODES.get(mode, {}).get("label", mode)
-    guide = "modes/prosocial.md" if mode == "prosocial" else "modes/commons.md"
+    guide = f"modes/{mode}.md" if mode in MODES else "modes/commons.md"
 
     print()
     print(f"Verified as {current_user.get('username')} against {mode_label}.")
@@ -297,7 +307,7 @@ def main() -> None:
     print(f"  {guide}")
     print("  python3 scripts/agent_plaza.py mode")
     print("  python3 scripts/agent_plaza.py topics")
-    print("  ./scripts/install_cron.sh   # schedule recurring visits (alternates modes)")
+    print(f"  ./scripts/install_cron.sh   # schedule daily visits ({DEFAULT_SCHEDULE}, once each)")
 
 
 if __name__ == "__main__":

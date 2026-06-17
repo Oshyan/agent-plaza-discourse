@@ -1,15 +1,17 @@
 #!/usr/bin/env sh
-# Install (or remove) a cron schedule that runs recurring Agent Village visits.
+# Install (or remove) the cron schedule for recurring Agent Village visits.
 #
-# Uses plain cron so it works on Linux and macOS. It does not use launchd.
-# Each cycle calls scripts/agent_visit.sh, which rotates through AGENT_VISIT_MODES
-# so commons and prosocial alternate.
+# Uses plain cron (works on Linux and macOS; not launchd). The schedule comes
+# from AGENT_VISIT_SCHEDULE: a comma list of modes, each run once per day by
+# default. Append ":N" to run a mode N times per day, e.g. "prosocial:2".
+# Default: commons,prosocial,constitution (each once daily), staggered across
+# the day so the three turns do not fire at once.
 #
 # Usage:
-#   scripts/install_cron.sh                 # install at AGENT_VISIT_INTERVAL_MIN (default 60)
-#   scripts/install_cron.sh --interval-min 30
-#   scripts/install_cron.sh --dry-run       # print the crontab line, install nothing
-#   scripts/install_cron.sh --uninstall     # remove the schedule
+#   scripts/install_cron.sh
+#   scripts/install_cron.sh --schedule "commons,prosocial:2,constitution"
+#   scripts/install_cron.sh --dry-run
+#   scripts/install_cron.sh --uninstall
 set -eu
 
 REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -21,50 +23,63 @@ if [ -f ./.env ]; then
 fi
 
 MARKER="# agent-village-commons visit"
-INTERVAL=${AGENT_VISIT_INTERVAL_MIN:-60}
+SCHEDULE=${AGENT_VISIT_SCHEDULE:-commons,prosocial,constitution}
 ACTION="install"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --interval-min) INTERVAL=$2; shift 2 ;;
-    --interval-min=*) INTERVAL=${1#*=}; shift ;;
+    --schedule) SCHEDULE=$2; shift 2 ;;
+    --schedule=*) SCHEDULE=${1#*=}; shift ;;
     --dry-run) ACTION="dry-run"; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-case "$INTERVAL" in (*[!0-9]*|'') echo "interval must be a whole number of minutes" >&2; exit 2 ;; esac
-
-cron_schedule() {
-  if [ "$INTERVAL" -lt 1 ]; then echo "0 * * * *"; return; fi
-  if [ "$INTERVAL" -lt 60 ]; then
-    if [ $((60 % INTERVAL)) -eq 0 ]; then echo "*/$INTERVAL * * * *"; return; fi
-    echo "*/$INTERVAL * * * *"; return
-  fi
-  if [ "$INTERVAL" -eq 60 ]; then echo "0 * * * *"; return; fi
-  if [ $((INTERVAL % 60)) -eq 0 ] && [ $((INTERVAL / 60)) -le 23 ]; then
-    echo "0 */$((INTERVAL / 60)) * * *"; return
-  fi
-  echo "0 * * * *"  # fallback: hourly
+# Build the cron lines from the schedule.
+build_lines() {
+  OLD_IFS=$IFS
+  IFS=','
+  # shellcheck disable=SC2086
+  set -- $SCHEDULE
+  IFS=$OLD_IFS
+  n=$#
+  [ "$n" -ge 1 ] || return 0
+  base_step=$(( 24 / n )); [ "$base_step" -ge 1 ] || base_step=1
+  i=0
+  for entry in "$@"; do
+    mode=${entry%%:*}
+    times=${entry#*:}
+    [ "$times" = "$entry" ] && times=1
+    case "$times" in (*[!0-9]*|'') times=1 ;; esac
+    [ "$times" -ge 1 ] || times=1
+    minute=$(( (i * 15) % 60 ))
+    base_hour=$(( i * base_step ))
+    step_hour=$(( 24 / times )); [ "$step_hour" -ge 1 ] || step_hour=1
+    j=0
+    while [ "$j" -lt "$times" ]; do
+      hour=$(( (base_hour + j * step_hour) % 24 ))
+      echo "$minute $hour * * * cd $REPO_DIR && /bin/sh scripts/agent_visit.sh $mode >> $REPO_DIR/visits.log 2>&1 $MARKER"
+      j=$(( j + 1 ))
+    done
+    i=$(( i + 1 ))
+  done
 }
 
-SCHEDULE=$(cron_schedule)
-CRON_LINE="$SCHEDULE cd $REPO_DIR && /bin/sh scripts/agent_visit.sh >> $REPO_DIR/visits.log 2>&1 $MARKER"
+LINES=$(build_lines)
 
 if [ "$ACTION" = "dry-run" ]; then
-  echo "$CRON_LINE"
+  printf '%s\n' "$LINES"
   exit 0
 fi
 
 if ! command -v crontab >/dev/null 2>&1; then
-  echo "crontab not found. Add this line to your scheduler manually:" >&2
-  echo "$CRON_LINE" >&2
+  echo "crontab not found. Add these lines to your scheduler manually:" >&2
+  printf '%s\n' "$LINES" >&2
   exit 1
 fi
 
-# Current crontab minus any prior lines we installed.
 EXISTING=$(crontab -l 2>/dev/null | grep -vF "$MARKER" || true)
 
 if [ "$ACTION" = "uninstall" ]; then
@@ -73,9 +88,9 @@ if [ "$ACTION" = "uninstall" ]; then
   exit 0
 fi
 
-{ printf '%s\n' "$EXISTING" | sed '/^$/d'; printf '%s\n' "$CRON_LINE"; } | crontab -
-echo "Installed Agent Village cron schedule:"
-echo "  $CRON_LINE"
+{ printf '%s\n' "$EXISTING" | sed '/^$/d'; printf '%s\n' "$LINES"; } | crontab -
+echo "Installed Agent Village cron schedule ($SCHEDULE):"
+printf '%s\n' "$LINES" | sed 's/^/  /'
 echo
 echo "Visits log: $REPO_DIR/visits.log"
 if [ -z "${AGENT_WAKE_CMD:-}" ]; then
