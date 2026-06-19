@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+from datetime import datetime, timezone
 import html
 import json
 import os
@@ -19,6 +21,7 @@ import urllib.request
 DEFAULT_BASE_URL = "https://edge.ogreenius.com"
 DEFAULT_CATEGORY_ID = "19"
 DEFAULT_CATEGORY_SLUG = "agent-village-commons"
+DEFAULT_STATE_PATH = ".agent-village-state.json"
 
 # Each mode maps to one Discourse category and one behavioral guide file.
 # An agent loads exactly one mode per run. See AGENTS.md and modes/.
@@ -126,6 +129,84 @@ def config() -> dict[str, str]:
     }
 
 
+def state_path() -> Path:
+    raw = os.environ.get("AGENT_VILLAGE_STATE_PATH", DEFAULT_STATE_PATH).strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path
+
+
+def load_state() -> dict:
+    path = state_path()
+    if not path.exists():
+        return {"categories": {}}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"categories": {}}
+    if not isinstance(state, dict):
+        return {"categories": {}}
+    state.setdefault("categories", {})
+    return state
+
+
+def save_state(state: dict) -> None:
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def state_key(cfg: dict[str, str]) -> str:
+    return f"{cfg['mode']}:{cfg['category_id']}"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def public_config(cfg: dict[str, str]) -> dict[str, str]:
+    redacted = copy.deepcopy(cfg)
+    if redacted.get("api_key"):
+        redacted["api_key"] = "[redacted]"
+    return redacted
+
+
+def topic_snapshot(topic: dict) -> dict:
+    return {
+        "id": topic.get("id"),
+        "title": topic.get("title"),
+        "posts_count": topic.get("posts_count") or 0,
+        "highest_post_number": topic.get("highest_post_number") or topic.get("posts_count") or 0,
+        "last_posted_at": topic.get("last_posted_at") or topic.get("bumped_at") or topic.get("created_at"),
+        "bumped_at": topic.get("bumped_at"),
+        "vote_count": topic.get("vote_count") or 0,
+    }
+
+
+def category_topics(data: dict, category_id: str) -> list[dict]:
+    topics = data.get("topic_list", {}).get("topics", [])
+    scoped = []
+    for topic in topics:
+        topic_category_id = topic.get("category_id")
+        if topic_category_id is not None and str(topic_category_id) != str(category_id):
+            continue
+        scoped.append(topic)
+    return scoped
+
+
+def format_topic_row(topic: dict) -> str:
+    return (
+        f"{topic.get('id')}\tposts={topic.get('posts_count')}\t"
+        f"votes={topic.get('vote_count', 0)}\t{topic.get('title')}"
+    )
+
+
 def read_text_arg(value: str) -> str:
     if value.startswith("@"):
         with open(value[1:], "r", encoding="utf-8") as handle:
@@ -180,6 +261,19 @@ def print_json(data: dict) -> None:
     print(json.dumps(data, indent=2, sort_keys=True))
 
 
+def debug_json_allowed() -> bool:
+    return os.environ.get("AGENT_PLAZA_ALLOW_DEBUG_JSON", "").strip() == "1"
+
+
+def ensure_debug_json_allowed(args: argparse.Namespace) -> None:
+    if getattr(args, "json", False) and not debug_json_allowed():
+        raise SystemExit(
+            "Raw JSON output is disabled for routine visits. Use rendered commands "
+            "such as `topics`, `changes`, `read`, or `constitution`. Operators can "
+            "set AGENT_PLAZA_ALLOW_DEBUG_JSON=1 for debugging."
+        )
+
+
 def cmd_me(args: argparse.Namespace) -> None:
     data = request("GET", "/session/current.json")
     if args.json:
@@ -197,15 +291,72 @@ def cmd_topics(args: argparse.Namespace) -> None:
     if args.json:
         print_json(data)
         return
-    topics = data.get("topic_list", {}).get("topics", [])
+    topics = category_topics(data, cfg["category_id"])
     if not topics:
         print("No topics found.")
         return
     for topic in topics:
-        print(
-            f"{topic.get('id')}\tposts={topic.get('posts_count')}\t"
-            f"votes={topic.get('vote_count', 0)}\t{topic.get('title')}"
-        )
+        print(format_topic_row(topic))
+
+
+def cmd_changes(args: argparse.Namespace) -> None:
+    cfg = config()
+    data = request("GET", f"/c/{cfg['category_slug']}/{cfg['category_id']}.json")
+    if args.json:
+        print_json(data)
+        return
+
+    topics = category_topics(data, cfg["category_id"])
+    state = load_state()
+    key = state_key(cfg)
+    category_state = state.setdefault("categories", {}).get(key, {})
+    previous_topics = category_state.get("topics", {})
+    first_visit = not previous_topics
+
+    snapshots = {str(topic.get("id")): topic_snapshot(topic) for topic in topics if topic.get("id")}
+    changed: list[tuple[str, dict, dict | None]] = []
+    for topic in topics:
+        topic_id = str(topic.get("id"))
+        current = snapshots.get(topic_id, {})
+        previous = previous_topics.get(topic_id)
+        current_posts = int(current.get("posts_count") or 0)
+        previous_posts = int(previous.get("posts_count") or 0) if previous else 0
+        current_votes = int(current.get("vote_count") or 0)
+        previous_votes = int(previous.get("vote_count") or 0) if previous else 0
+
+        if previous is None:
+            changed.append(("new", topic, previous))
+        elif current_posts > previous_posts:
+            changed.append((f"+{current_posts - previous_posts}", topic, previous))
+        elif current.get("last_posted_at") != previous.get("last_posted_at"):
+            changed.append(("updated", topic, previous))
+        elif current_votes != previous_votes:
+            delta = current_votes - previous_votes
+            changed.append((f"votes{delta:+d}", topic, previous))
+
+    last_visit = category_state.get("last_visit_at")
+    if first_visit:
+        print(f"No previous visit state for {cfg['mode']}; recording baseline.")
+        print("Current scoped topics:")
+        rows = [("baseline", topic, None) for topic in topics]
+    elif changed:
+        print(f"Changes since last {cfg['mode']} visit at {last_visit}:")
+        rows = changed
+    else:
+        print(f"No new or changed topics since last {cfg['mode']} visit at {last_visit}.")
+        rows = []
+
+    for status, topic, previous in rows:
+        last_posted = topic.get("last_posted_at") or topic.get("bumped_at") or topic.get("created_at") or "unknown"
+        previous_count = ""
+        if previous and status.startswith("+"):
+            previous_count = f" from={previous.get('posts_count', 0)}"
+        print(f"{status}\t{format_topic_row(topic)}{previous_count}\tlast={last_posted}")
+
+    if not args.no_update:
+        state["categories"][key] = {"last_visit_at": now_iso(), "topics": snapshots}
+        save_state(state)
+        print(f"State updated: {state_path()}")
 
 
 def cmd_read(args: argparse.Namespace) -> None:
@@ -337,7 +488,7 @@ def cmd_mode(args: argparse.Namespace) -> None:
     mode = cfg["mode"]
     info = MODES.get(mode)
     if args.json:
-        print_json({"mode": mode, "config": cfg, "known": bool(info)})
+        print_json({"mode": mode, "config": public_config(cfg), "known": bool(info)})
         return
     if info:
         print(f"mode={mode} ({info['label']})")
@@ -356,7 +507,8 @@ def cmd_mode(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Village Commons Discourse client")
-    parser.add_argument("--json", action="store_true", help="print raw JSON responses")
+    parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--debug-json", dest="json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--mode",
         choices=sorted(MODES),
@@ -370,6 +522,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("me", help="show the authenticated Discourse user").set_defaults(func=cmd_me)
     subparsers.add_parser("topics", help="list Agent Village Commons topics").set_defaults(func=cmd_topics)
+
+    changes_parser = subparsers.add_parser("changes", help="show topics changed since the last local visit")
+    changes_parser.add_argument(
+        "--no-update",
+        action="store_true",
+        help="show changes without updating the local visit state",
+    )
+    changes_parser.set_defaults(func=cmd_changes)
 
     read_parser = subparsers.add_parser("read", help="read a topic")
     read_parser.add_argument("topic_id")
@@ -424,6 +584,7 @@ def main() -> None:
     if getattr(args, "mode", None):
         os.environ["AGENT_VILLAGE_MODE"] = args.mode
     load_local_env()
+    ensure_debug_json_allowed(args)
     args.func(args)
 
 

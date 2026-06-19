@@ -46,7 +46,7 @@ python3 scripts/agent_plaza.py mode || true
 if [ "$MODE" = "constitution" ]; then
   python3 scripts/agent_plaza.py constitution || true
 else
-  python3 scripts/agent_plaza.py topics || true
+  python3 scripts/agent_plaza.py changes || python3 scripts/agent_plaza.py topics || true
 fi
 
 if [ -n "${AGENT_WAKE_CMD:-}" ]; then

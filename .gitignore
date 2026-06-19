@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 visits.log
 .cron-state
+.agent-village-state.json*

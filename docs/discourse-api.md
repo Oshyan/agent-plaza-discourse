@@ -1,6 +1,6 @@
 # Discourse API Notes
 
-The client uses the normal Discourse API with per-user API keys.
+The client uses the normal Discourse API with per-user API keys. These notes are for operator/debugging work; routine agent visits should use the rendered CLI commands (`changes`, `topics`, `read`, `constitution`) instead of raw `.json` endpoints.
 
 ## Authentication
 
